@@ -307,17 +307,20 @@ class Example:
             self.act = self.policy(obs_batch)
             self.rearranged_act = torch.gather(self.act, 1, self.mujoco_to_lab_indices.unsqueeze(0).repeat(self.num_worlds, 1))
             
-            # Apply actions to all worlds
+            # Compute target positions for all worlds
+            target_positions = self.joint_pos_initial + 0.5 * self.rearranged_act
+            
+            # Create full target array with zeros for floating base DOFs
+            full_targets = torch.zeros(self.num_worlds * (self.joint_dof_count + 6), device=self.torch_device, dtype=torch.float32)
+            
+            # Fill in the actuated joint targets for each world
             for world_idx in range(self.num_worlds):
-                a = self.joint_pos_initial[world_idx] + 0.5 * self.rearranged_act[world_idx]
-                a_with_zeros = torch.cat([torch.zeros(6, device=self.torch_device, dtype=torch.float32), a])
-                a_wp = wp.from_torch(a_with_zeros, dtype=wp.float32, requires_grad=False)
-                
-                start_idx = world_idx * (self.joint_dof_count + 6)
-                wp.copy(
-                    self.control.joint_target_pos[start_idx:start_idx + self.joint_dof_count + 6], 
-                    a_wp
-                )
+                start_idx = world_idx * (self.joint_dof_count + 6) + 6
+                full_targets[start_idx:start_idx + self.joint_dof_count] = target_positions[world_idx]
+            
+            # Convert to warp and copy once
+            targets_wp = wp.from_torch(full_targets, dtype=wp.float32, requires_grad=False)
+            wp.copy(self.control.joint_target_pos, targets_wp)
         
         if self.graph:
             wp.capture_launch(self.graph)
