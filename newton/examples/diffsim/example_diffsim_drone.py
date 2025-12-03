@@ -62,6 +62,11 @@ class Propeller:
 def increment_seed(
     seed: wp.array(dtype=int),
 ):
+    """
+    Increments the random seed for trajectory sampling.
+    Ensures different random samples across MPC iterations to maintain exploration diversity.
+    Essential for preventing the optimizer from getting stuck in local minima.
+    """
     seed[0] += 1
 
 
@@ -75,6 +80,21 @@ def sample_gaussian(
     seed: wp.array(dtype=int),
     rollout_trajectories: wp.array(dtype=float, ndim=3),
 ):
+    """
+    Samples trajectory variations using Gaussian noise for MPC exploration.
+    
+    Core of the trajectory optimization: generates diverse control candidates by adding
+    noise to the current best trajectory. Each rollout world explores a different
+    trajectory variation, enabling parallel evaluation of multiple control strategies.
+    
+    Process:
+    1. Generate unique random state per (world, control_point, control_dimension)
+    2. Sample from Gaussian distribution around mean trajectory
+    3. Reject samples outside control limits and resample (up to 10 attempts)
+    4. Clamp final sample to ensure feasibility
+    
+    This stochastic sampling is crucial for escaping local optima in the MPC optimization.
+    """
     world_id, point_id, control_id = wp.tid()
     unique_id = (world_id * num_control_points + point_id) * control_dim + control_id
     r = wp.rand_init(seed[0], unique_id)
@@ -97,6 +117,16 @@ def replicate_states(
     body_q_out: wp.array(dtype=wp.transform),
     body_qd_out: wp.array(dtype=wp.spatial_vector),
 ):
+    """
+    Copies the current drone state to all rollout simulation worlds.
+    
+    Initializes parallel MPC rollouts from identical starting conditions.
+    Each rollout world begins with the same drone pose and velocity,
+    then diverges based on different trajectory samples.
+    
+    Critical for fair comparison between trajectory candidates - ensures
+    all rollouts evaluate from the same initial state.
+    """
     tid = wp.tid()
     world_offset = tid * bodies_per_world
     for i in range(bodies_per_world):
@@ -115,22 +145,47 @@ def drone_cost(
     weighting: float,
     cost: wp.array(dtype=wp.float32),
 ):
+    """
+    Computes multi-objective cost function for drone trajectory evaluation.
+    
+    This is the heart of the MPC optimization - defines what constitutes "good" drone behavior.
+    Combines multiple objectives with careful weighting to achieve desired flight characteristics:
+    
+    Cost Components:
+    1. Position Cost: Squared distance to target (primary objective)
+    2. Altitude Cost: Penalties for flying too high (>0.75m) or too low (<0.25m)
+    3. Upright Cost: Encourages maintaining upright orientation (drone up ≈ world up)
+    4. Velocity Cost: Prefers hovering behavior (zero velocity near targets)
+    5. Control Cost: Minimizes propeller effort to improve efficiency
+    
+    Temporal Discounting: Future costs are exponentially discounted (0.8^timestep)
+    to prioritize immediate objectives while maintaining long-term planning.
+    
+    Gradients flow backward through this function during optimization, guiding
+    the trajectory parameters toward lower-cost (better) control strategies.
+    """
     world_id = wp.tid()
     tf = body_q[world_id]
     target = targets[0]
 
+    # Position tracking: minimize distance to current target
     pos_drone = wp.transform_get_translation(tf)
     pos_cost = wp.length_sq(pos_drone - target)
+    
+    # Altitude constraints: keep drone within safe flying envelope
     altitude_cost = wp.max(pos_drone[2] - 0.75, 0.0) + wp.max(0.25 - pos_drone[2], 0.0)
+    
+    # Orientation stability: encourage upright flight for stability
     upvector = wp.vec3(0.0, 0.0, 1.0)
     drone_up = wp.transform_vector(tf, upvector)
     upright_cost = 1.0 - wp.dot(drone_up, upvector)
 
     vel_drone = body_qd[world_id]
 
-    # Encourage zero velocity.
+    # Velocity regulation: encourage hovering behavior for precision
     vel_cost = wp.length_sq(vel_drone)
 
+    # Control effort: minimize energy consumption and actuator wear
     control = wp.vec4(
         prop_control[world_id * 4 + 0],
         prop_control[world_id * 4 + 1],
@@ -139,15 +194,18 @@ def drone_cost(
     )
     control_cost = wp.dot(control, control)
 
+    # Temporal discounting: prioritize near-term costs over distant future
     discount = 0.8 ** wp.float(horizon_length - step - 1) / wp.float(horizon_length) ** 2.0
 
-    pos_weight = 1000.0
-    altitude_weight = 100.0
-    control_weight = 0.05
-    vel_weight = 0.1
-    upright_weight = 10.0
+    # Cost weights: balance competing objectives
+    pos_weight = 1000.0      # Primary: reach target
+    altitude_weight = 100.0  # Safety: maintain safe altitude
+    control_weight = 0.05    # Efficiency: minimize control effort
+    vel_weight = 0.1         # Stability: prefer smooth motion
+    upright_weight = 10.0    # Stability: maintain orientation
     total_weight = pos_weight + altitude_weight + control_weight + vel_weight + upright_weight
 
+    # Accumulate weighted, discounted cost for this rollout world
     wp.atomic_add(
         cost,
         world_id,
@@ -176,21 +234,41 @@ def collision_cost(
     weighting: float,
     cost: wp.array(dtype=wp.float32),
 ):
+    """
+    Computes collision avoidance costs using signed distance functions (SDFs).
+    
+    Implements differentiable collision detection for obstacle avoidance in MPC.
+    Uses smooth distance-based penalties rather than hard constraints, enabling
+    gradient-based optimization while maintaining safety.
+    
+    Process:
+    1. Transform drone position to obstacle's local coordinate frame
+    2. Evaluate obstacle's SDF to get minimum distance
+    3. Apply penalty if distance < safety margin
+    4. Accumulate cost using atomic operations for thread safety
+    
+    Supports multiple geometry types (sphere, box, capsule, cylinder, cone, mesh, SDF, plane)
+    through unified SDF interface. The smooth distance-based cost enables gradients
+    to flow properly, guiding trajectories away from obstacles.
+    
+    Critical for safe autonomous flight in cluttered environments.
+    """
     world_id, obs_id = wp.tid()
     shape_index = obstacle_ids[world_id, obs_id]
 
+    # Get drone position in world coordinates
     px = wp.transform_get_translation(body_q[world_id])
 
     X_bs = shape_X_bs[shape_index]
 
-    # transform particle position to shape local space
+    # Transform drone position to obstacle's local coordinate frame
     x_local = wp.transform_point(wp.transform_inverse(X_bs), px)
 
-    # geo description
+    # Get obstacle geometry description
     geo_type = shape_type[shape_index]
     geo_scale = shape_scale[shape_index]
 
-    # evaluate shape sdf
+    # Evaluate signed distance function based on geometry type
     d = 1e6
 
     if geo_type == newton.GeoType.SPHERE:
@@ -217,9 +295,10 @@ def collision_cost(
     elif geo_type == newton.GeoType.PLANE:
         d = plane_sdf(geo_scale[0], geo_scale[1], x_local)
 
-    d = wp.max(d, 0.0)
+    # Apply collision penalty if within safety margin
+    d = wp.max(d, 0.0)  # Only penalize penetration/proximity
     if d < margin:
-        c = margin - d
+        c = margin - d  # Linear penalty increases as distance decreases
         wp.atomic_add(cost, world_id, weighting * c)
 
 
@@ -228,6 +307,16 @@ def enforce_control_limits(
     control_limits: wp.array(dtype=float, ndim=2),
     control_points: wp.array(dtype=float, ndim=3),
 ):
+    """
+    Enforces physical constraints on control parameters after optimization.
+    
+    Clamps optimized control values to feasible ranges (e.g., propeller thrust 0.1-1.0).
+    Essential for maintaining physical realizability of computed trajectories.
+    
+    Applied after each gradient descent step to ensure all control commands
+    remain within actuator limits, preventing the optimizer from exploring
+    infeasible regions of the control space.
+    """
     world_id, t_id, control_id = wp.tid()
     lo, hi = control_limits[control_id, 0], control_limits[control_id, 1]
     control_points[world_id, t_id, control_id] = wp.clamp(control_points[world_id, t_id, control_id], lo, hi)
@@ -239,6 +328,15 @@ def pick_best_trajectory(
     lowest_cost_id: int,
     best_traj: wp.array(dtype=float, ndim=3),
 ):
+    """
+    Selects the lowest-cost trajectory from all rollout evaluations.
+    
+    After parallel evaluation of all trajectory candidates, copies the
+    control parameters from the best-performing rollout to become the
+    new reference trajectory for the next MPC iteration.
+    
+    This implements the "selection" phase of the MPC optimization cycle.
+    """
     t_id, control_id = wp.tid()
     best_traj[0, t_id, control_id] = rollout_trajectories[lowest_cost_id, t_id, control_id]
 
@@ -252,13 +350,35 @@ def interpolate_control_linear(
     torque_dim: int,
     torques: wp.array(dtype=float),
 ):
+    """
+    Converts sparse control waypoints into continuous control signals via linear interpolation.
+    
+    MPC optimizes control at discrete time points, but the physics simulation requires
+    control inputs at every timestep. This kernel performs real-time interpolation
+    between control waypoints to generate smooth, continuous control commands.
+    
+    Process:
+    1. Determine which control segment we're in based on current time
+    2. Compute fractional position within the segment
+    3. Linearly interpolate between adjacent control points
+    4. Apply control gains to convert normalized commands to actual propeller thrust
+    
+    Critical for smooth drone operation - prevents jerky motion that would occur
+    from discontinuous control updates.
+    """
     world_id, control_id = wp.tid()
-    t_id = int(t)
-    frac = t - wp.floor(t)
+    t_id = int(t)  # Which control segment (integer part)
+    frac = t - wp.floor(t)  # Position within segment (fractional part)
+    
+    # Get adjacent control waypoints
     control_left = control_points[world_id, t_id, control_id]
     control_right = control_points[world_id, t_id + 1, control_id]
+    
+    # Linear interpolation between waypoints
     torque_id = world_id * torque_dim + control_dofs[control_id]
     action = control_left * (1.0 - frac) + control_right * frac
+    
+    # Apply gains to convert to actual propeller commands
     torques[torque_id] = action * control_gains[control_id]
 
 
@@ -270,17 +390,46 @@ def compute_prop_wrenches(
     body_com: wp.array(dtype=wp.vec3),
     body_f: wp.array(dtype=wp.spatial_vector),
 ):
+    """
+    Converts propeller control commands into physical forces and torques.
+    
+    Implements the core quadrotor dynamics: transforms normalized propeller thrust
+    commands into 6DOF forces and torques applied to the drone's rigid body.
+    
+    Physics Model:
+    1. Thrust Force: Propeller generates force along its axis (typically +Z)
+    2. Reaction Torque: Newton's 3rd law creates counter-rotation torque
+    3. Moment Arm: Thrust applied off-center creates body torques for attitude control
+    4. Angular Damping: Reduces oscillations for stability (0.8 factor)
+    
+    This is where the control abstraction meets physical reality - the bridge
+    between high-level trajectory optimization and low-level motor commands.
+    
+    Gradients flow through this function during differentiation, enabling the
+    optimizer to understand how control inputs affect drone motion.
+    """
     tid = wp.tid()
     prop = props[tid]
-    control = controls[tid]
+    control = controls[tid]  # Normalized thrust command (0.1 to 1.0)
+    
+    # Get drone's current pose
     tf = body_q[prop.body]
+    
+    # Transform propeller thrust direction to world coordinates
     dir = wp.transform_vector(tf, prop.dir)
+    
+    # Compute thrust force and reaction torque
     force = dir * prop.max_thrust * control
     torque = dir * prop.max_torque * control * prop.turning_direction
+    
+    # Add torque from thrust applied at offset from center of mass
     moment_arm = wp.transform_point(tf, prop.pos) - wp.transform_point(tf, body_com[prop.body])
     torque += wp.cross(moment_arm, force)
-    # Apply angular damping.
+    
+    # Apply angular damping for stability
     torque *= 0.8
+    
+    # Accumulate forces and torques on the drone body
     wp.atomic_add(body_f, prop.body, wp.spatial_vector(force, torque))
 
 
