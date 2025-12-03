@@ -76,27 +76,28 @@ def compute_obs(actions, state: State, joint_pos_initial, device, indices, gravi
 
 
 class Example:
-    def __init__(self, viewer, args=None):
+    def __init__(self, viewer, num_worlds=8, args=None):
         self.viewer = viewer
         self.device = wp.get_device()
         self.torch_device = device_to_torch(self.device)
         self.is_test = args is not None and args.test
+        self.num_worlds = num_worlds
 
-        builder = newton.ModelBuilder()
-        newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
-        builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
+        articulation_builder = newton.ModelBuilder()
+        newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
+        articulation_builder.default_joint_cfg = newton.ModelBuilder.JointDofConfig(
             armature=0.06,
             limit_ke=1.0e3,
             limit_kd=1.0e1,
         )
-        builder.default_shape_cfg.ke = 5.0e4
-        builder.default_shape_cfg.kd = 5.0e2
-        builder.default_shape_cfg.kf = 1.0e3
-        builder.default_shape_cfg.mu = 0.75
+        articulation_builder.default_shape_cfg.ke = 5.0e4
+        articulation_builder.default_shape_cfg.kd = 5.0e2
+        articulation_builder.default_shape_cfg.kf = 1.0e3
+        articulation_builder.default_shape_cfg.mu = 0.75
 
         asset_path = newton.utils.download_asset("anybotics_anymal_c")
         stage_path = str(asset_path / "urdf" / "anymal.urdf")
-        builder.add_urdf(
+        articulation_builder.add_urdf(
             stage_path,
             xform=wp.transform(wp.vec3(0.0, 0.0, 0.62), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), wp.pi * 0.5)),
             floating=True,
@@ -104,6 +105,33 @@ class Example:
             collapse_fixed_joints=True,
             ignore_inertial_definitions=False,
         )
+
+        # set initial joint positions
+        initial_q = {
+            "RH_HAA": 0.0,
+            "RH_HFE": -0.4,
+            "RH_KFE": 0.8,
+            "LH_HAA": 0.0,
+            "LH_HFE": -0.4,
+            "LH_KFE": 0.8,
+            "RF_HAA": 0.0,
+            "RF_HFE": 0.4,
+            "RF_KFE": -0.8,
+            "LF_HAA": 0.0,
+            "LF_HFE": 0.4,
+            "LF_KFE": -0.8,
+        }
+        # Set initial joint positions (skip first 7 position coordinates which are the free joint), e.g. for "LF_HAA" value will be written at index 1+6 = 7.
+        for key, value in initial_q.items():
+            articulation_builder.joint_q[articulation_builder.joint_key.index(key) + 6] = value
+
+        for i in range(len(articulation_builder.joint_target_ke)):
+            articulation_builder.joint_target_ke[i] = 150
+            articulation_builder.joint_target_kd[i] = 5
+
+        builder = newton.ModelBuilder()
+        for _ in range(self.num_worlds):
+            builder.add_world(articulation_builder)
 
         # Generate procedural terrain for visual demonstration (but not during unit tests)
         if not self.is_test:
@@ -131,29 +159,6 @@ class Example:
         self.sim_substeps = 4
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        # set initial joint positions
-        initial_q = {
-            "RH_HAA": 0.0,
-            "RH_HFE": -0.4,
-            "RH_KFE": 0.8,
-            "LH_HAA": 0.0,
-            "LH_HFE": -0.4,
-            "LH_KFE": 0.8,
-            "RF_HAA": 0.0,
-            "RF_HFE": 0.4,
-            "RF_KFE": -0.8,
-            "LF_HAA": 0.0,
-            "LF_HFE": 0.4,
-            "LF_KFE": -0.8,
-        }
-        # Set initial joint positions (skip first 7 position coordinates which are the free joint), e.g. for "LF_HAA" value will be written at index 1+6 = 7.
-        for key, value in initial_q.items():
-            builder.joint_q[builder.joint_key.index(key) + 6] = value
-
-        for i in range(len(builder.joint_target_ke)):
-            builder.joint_target_ke[i] = 150
-            builder.joint_target_kd[i] = 5
-
         self.model = builder.finalize()
 
         # Create collision pipeline from command-line args (default: CollisionPipelineUnified with EXPLICIT)
@@ -164,7 +169,8 @@ class Example:
             self.model,
             use_mujoco_contacts=args.use_mujoco_contacts if args else False,
             ls_parallel=True,
-            njmax=50,
+            njmax=6144,
+            nconmax=6144,
         )
 
         self.viewer.set_model(self.model)
@@ -195,25 +201,37 @@ class Example:
         policy_path = str(policy_asset_path / "rl_policies" / "anymal_walking_policy_physx.pt")
 
         self.policy = torch.jit.load(policy_path, map_location=self.torch_device)
-        self.joint_pos_initial = torch.tensor(
-            self.state_0.joint_q[7:], device=self.torch_device, dtype=torch.float32
-        ).unsqueeze(0)
-        self.joint_vel_initial = torch.tensor(self.state_0.joint_qd[6:], device=self.torch_device, dtype=torch.float32)
-        self.act = torch.zeros(1, 12, device=self.torch_device, dtype=torch.float32)
-        self.rearranged_act = torch.zeros(1, 12, device=self.torch_device, dtype=torch.float32)
+        
+        # Initialize batch tensors for all worlds
+        self.joint_dof_count = articulation_builder.joint_dof_count - 6  # Exclude floating base DOFs
+        self.joint_pos_initial = torch.zeros(self.num_worlds, self.joint_dof_count, device=self.torch_device, dtype=torch.float32)
+        
+        for world_idx in range(self.num_worlds):
+            start_idx = world_idx * articulation_builder.joint_dof_count + 7  # Skip floating base position coords
+            end_idx = start_idx + self.joint_dof_count
+            self.joint_pos_initial[world_idx] = torch.tensor(
+                self.state_0.joint_q[start_idx:end_idx], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            )
+        
+        self.joint_vel_initial = torch.tensor(self.state_0.joint_qd[6:6+self.joint_dof_count], device=self.torch_device, dtype=torch.float32)
+        self.act = torch.zeros(self.num_worlds, 12, device=self.torch_device, dtype=torch.float32)
+        self.rearranged_act = torch.zeros(self.num_worlds, 12, device=self.torch_device, dtype=torch.float32)
 
         # Pre-compute tensors that don't change during simulation
         self.lab_to_mujoco_indices = torch.tensor(lab_to_mujoco, device=self.torch_device)
         self.mujoco_to_lab_indices = torch.tensor(mujoco_to_lab, device=self.torch_device)
-        self.gravity_vec = torch.tensor([[0.0, 0.0, -1.0]], device=self.torch_device, dtype=torch.float32)
-        self.command = torch.zeros((1, 3), device=self.torch_device, dtype=torch.float32)
-        self.command[0, 0] = 1
+        self.gravity_vec = torch.tensor([[0.0, 0.0, -1.0]], device=self.torch_device, dtype=torch.float32).repeat(self.num_worlds, 1)
+        self.command = torch.zeros((self.num_worlds, 3), device=self.torch_device, dtype=torch.float32)
+        self.command[:, 0] = 1
 
         self.capture()
 
     def capture(self):
         if self.device.is_cuda:
-            torch_tensor = torch.zeros(18, device=self.torch_device, dtype=torch.float32)
+            total_dofs = (self.joint_dof_count + 6) * self.num_worlds
+            torch_tensor = torch.zeros(total_dofs, device=self.torch_device, dtype=torch.float32)
             self.control.joint_target_pos = wp.from_torch(torch_tensor, dtype=wp.float32, requires_grad=False)
             with wp.ScopedCapture() as capture:
                 self.simulate()
@@ -237,24 +255,70 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
-        obs = compute_obs(
-            self.act,
-            self.state_0,
-            self.joint_pos_initial,
-            self.torch_device,
-            self.lab_to_mujoco_indices,
-            self.gravity_vec,
-            self.command,
-        )
+        # Compute observations for all worlds in batch
+        obs_list = []
+        for world_idx in range(self.num_worlds):
+            # Extract state for this world
+            dof_start = world_idx * (self.joint_dof_count + 6)
+            
+            root_quat_w = torch.tensor(
+                self.state_0.joint_q[dof_start + 3:dof_start + 7], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            ).unsqueeze(0)
+            root_lin_vel_w = torch.tensor(
+                self.state_0.joint_qd[dof_start:dof_start + 3], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            ).unsqueeze(0)
+            root_ang_vel_w = torch.tensor(
+                self.state_0.joint_qd[dof_start + 3:dof_start + 6], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            ).unsqueeze(0)
+            joint_pos_current = torch.tensor(
+                self.state_0.joint_q[dof_start + 7:dof_start + 7 + self.joint_dof_count], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            ).unsqueeze(0)
+            joint_vel_current = torch.tensor(
+                self.state_0.joint_qd[dof_start + 6:dof_start + 6 + self.joint_dof_count], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            ).unsqueeze(0)
+            
+            vel_b = quat_rotate_inverse(root_quat_w, root_lin_vel_w)
+            a_vel_b = quat_rotate_inverse(root_quat_w, root_ang_vel_w)
+            grav = quat_rotate_inverse(root_quat_w, self.gravity_vec[world_idx:world_idx+1])
+            joint_pos_rel = joint_pos_current - self.joint_pos_initial[world_idx:world_idx+1]
+            joint_vel_rel = joint_vel_current
+            rearranged_joint_pos_rel = torch.index_select(joint_pos_rel, 1, self.lab_to_mujoco_indices)
+            rearranged_joint_vel_rel = torch.index_select(joint_vel_rel, 1, self.lab_to_mujoco_indices)
+            obs = torch.cat(
+                [vel_b, a_vel_b, grav, self.command[world_idx:world_idx+1], 
+                 rearranged_joint_pos_rel, rearranged_joint_vel_rel, self.act[world_idx:world_idx+1]], 
+                dim=1
+            )
+            obs_list.append(obs)
+        
+        # Stack all observations and run policy in batch
+        obs_batch = torch.cat(obs_list, dim=0)
         with torch.no_grad():
-            self.act = self.policy(obs)
-            self.rearranged_act = torch.gather(self.act, 1, self.mujoco_to_lab_indices.unsqueeze(0))
-            a = self.joint_pos_initial + 0.5 * self.rearranged_act
-            a_with_zeros = torch.cat([torch.zeros(6, device=self.torch_device, dtype=torch.float32), a.squeeze(0)])
-            a_wp = wp.from_torch(a_with_zeros, dtype=wp.float32, requires_grad=False)
-            wp.copy(
-                self.control.joint_target_pos, a_wp
-            )  # this can actually be optimized by doing  wp.copy(self.solver.mjw_data.ctrl[0], a_wp) and not launching  apply_mjc_control_kernel each step. Typically we update position and velocity targets at the rate of the outer control loop.
+            self.act = self.policy(obs_batch)
+            self.rearranged_act = torch.gather(self.act, 1, self.mujoco_to_lab_indices.unsqueeze(0).repeat(self.num_worlds, 1))
+            
+            # Apply actions to all worlds
+            for world_idx in range(self.num_worlds):
+                a = self.joint_pos_initial[world_idx] + 0.5 * self.rearranged_act[world_idx]
+                a_with_zeros = torch.cat([torch.zeros(6, device=self.torch_device, dtype=torch.float32), a])
+                a_wp = wp.from_torch(a_with_zeros, dtype=wp.float32, requires_grad=False)
+                
+                start_idx = world_idx * (self.joint_dof_count + 6)
+                wp.copy(
+                    self.control.joint_target_pos[start_idx:start_idx + self.joint_dof_count + 6], 
+                    a_wp
+                )
+        
         if self.graph:
             wp.capture_launch(self.graph)
         else:
@@ -330,8 +394,11 @@ class Example:
 
 if __name__ == "__main__":
     # Parse arguments and initialize viewer
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--num-worlds", type=int, default=8, help="Total number of simulated worlds.")
 
-    example = Example(viewer, args)
+    viewer, args = newton.examples.init(parser)
+
+    example = Example(viewer, args.num_worlds, args=args)
 
     newton.examples.run(example, args)
