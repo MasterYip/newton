@@ -131,7 +131,7 @@ class Example:
 
         builder = newton.ModelBuilder()
         for _ in range(self.num_worlds):
-            builder.add_world(articulation_builder)
+            builder.add_world(articulation_builder, xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
 
         # Generate procedural terrain for visual demonstration (but not during unit tests)
         if not self.is_test:
@@ -175,7 +175,7 @@ class Example:
 
         self.viewer.set_model(self.model)
 
-        self.follow_cam = True
+        self.follow_cam = False
 
         if isinstance(self.viewer, newton.viewer.ViewerGL):
 
@@ -204,13 +204,16 @@ class Example:
         
         # Initialize batch tensors for all worlds
         self.joint_dof_count = articulation_builder.joint_dof_count - 6  # Exclude floating base DOFs
+        self.joint_q_per_robot = articulation_builder.joint_dof_count + 1  # 7 pos (3 pos + 4 quat) + actuated joints
+        self.joint_qd_per_robot = articulation_builder.joint_dof_count  # 6 vel (3 lin + 3 ang) + actuated joints
         self.joint_pos_initial = torch.zeros(self.num_worlds, self.joint_dof_count, device=self.torch_device, dtype=torch.float32)
         
         for world_idx in range(self.num_worlds):
-            start_idx = world_idx * articulation_builder.joint_dof_count + 7  # Skip floating base position coords
-            end_idx = start_idx + self.joint_dof_count
+            # joint_q has 7 base coords (3 pos + 4 quat) + actuated joints
+            q_start_idx = world_idx * self.joint_q_per_robot + 7  # Skip floating base position coords
+            q_end_idx = q_start_idx + self.joint_dof_count
             self.joint_pos_initial[world_idx] = torch.tensor(
-                self.state_0.joint_q[start_idx:end_idx], 
+                self.state_0.joint_q[q_start_idx:q_end_idx], 
                 device=self.torch_device, 
                 dtype=torch.float32
             )
@@ -258,31 +261,33 @@ class Example:
         # Compute observations for all worlds in batch
         obs_list = []
         for world_idx in range(self.num_worlds):
-            # Extract state for this world
-            dof_start = world_idx * (self.joint_dof_count + 6)
+            # joint_q: 7 base (3 pos + 4 quat) + actuated joints per robot
+            # joint_qd: 6 base (3 lin vel + 3 ang vel) + actuated joints per robot
+            q_start = world_idx * self.joint_q_per_robot
+            qd_start = world_idx * self.joint_qd_per_robot
             
             root_quat_w = torch.tensor(
-                self.state_0.joint_q[dof_start + 3:dof_start + 7], 
+                self.state_0.joint_q[q_start + 3:q_start + 7], 
                 device=self.torch_device, 
                 dtype=torch.float32
             ).unsqueeze(0)
             root_lin_vel_w = torch.tensor(
-                self.state_0.joint_qd[dof_start:dof_start + 3], 
+                self.state_0.joint_qd[qd_start:qd_start + 3], 
                 device=self.torch_device, 
                 dtype=torch.float32
             ).unsqueeze(0)
             root_ang_vel_w = torch.tensor(
-                self.state_0.joint_qd[dof_start + 3:dof_start + 6], 
+                self.state_0.joint_qd[qd_start + 3:qd_start + 6], 
                 device=self.torch_device, 
                 dtype=torch.float32
             ).unsqueeze(0)
             joint_pos_current = torch.tensor(
-                self.state_0.joint_q[dof_start + 7:dof_start + 7 + self.joint_dof_count], 
+                self.state_0.joint_q[q_start + 7:q_start + 7 + self.joint_dof_count], 
                 device=self.torch_device, 
                 dtype=torch.float32
             ).unsqueeze(0)
             joint_vel_current = torch.tensor(
-                self.state_0.joint_qd[dof_start + 6:dof_start + 6 + self.joint_dof_count], 
+                self.state_0.joint_qd[qd_start + 6:qd_start + 6 + self.joint_dof_count], 
                 device=self.torch_device, 
                 dtype=torch.float32
             ).unsqueeze(0)
