@@ -130,10 +130,9 @@ class Example:
             articulation_builder.joint_target_kd[i] = 5
 
         builder = newton.ModelBuilder()
-        for _ in range(self.num_worlds):
-            builder.add_world(articulation_builder, xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()))
-
+        
         # Generate procedural terrain for visual demonstration (but not during unit tests)
+        # Add terrain BEFORE adding worlds so it's shared across all environments
         if not self.is_test:
             vertices, indices = generate_terrain_grid(
                 grid_size=(8, 3),  # 3x8 grid for forward walking
@@ -149,10 +148,20 @@ class Example:
             terrain_mesh = newton.Mesh(vertices, indices)
             terrain_offset = wp.transform(p=wp.vec3(-5, -2.0, 0.01), q=wp.quat_identity())
             builder.add_shape_mesh(body=-1, mesh=terrain_mesh, xform=terrain_offset)
+        
         builder.add_ground_plane()
+        
+        # Add worlds in a grid layout with spacing
+        grid_spacing = 1.0  # Spacing between robots in meters
+        grid_cols = int(self.num_worlds**0.5)  # Square grid
+        for world_idx in range(self.num_worlds):
+            row = world_idx // grid_cols
+            col = world_idx % grid_cols
+            offset = wp.vec3(col * grid_spacing, row * grid_spacing, 0.1)
+            builder.add_world(articulation_builder, xform=wp.transform(offset, wp.quat_identity()))
 
         self.sim_time = 0.0
-        self.sim_step = 0
+
         fps = 50
         self.frame_dt = 1.0 / fps
 
@@ -172,8 +181,8 @@ class Example:
             njmax=6144,
             nconmax=6144,
         )
-
         self.viewer.set_model(self.model)
+        self.viewer.set_world_offsets(wp.vec3(0.0, 0.0, 0.0))
 
         self.follow_cam = False
 
