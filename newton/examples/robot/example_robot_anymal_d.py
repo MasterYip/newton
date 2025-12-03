@@ -24,6 +24,8 @@
 
 import mujoco
 import warp as wp
+import torch
+from warp.torch import device_to_torch
 
 import newton
 import newton.examples
@@ -43,6 +45,7 @@ class Example:
         self.viewer = viewer
 
         self.device = wp.get_device()
+        self.torch_device = device_to_torch(self.device)
 
         articulation_builder = newton.ModelBuilder(up_axis=newton.Axis.Z)
         newton.solvers.SolverMuJoCo.register_custom_attributes(articulation_builder)
@@ -86,7 +89,7 @@ class Example:
             impratio=100,
             iterations=100,
             ls_iterations=50,
-            nconmax=20,
+            nconmax=6144,
             njmax=100,
             use_mujoco_contacts=args.use_mujoco_contacts if args else False,
         )
@@ -94,6 +97,21 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+
+        # Initialize random action generation
+        self.joint_dof_count = articulation_builder.joint_dof_count - 6  # Exclude floating base DOFs
+        self.action_scale = 0.5  # Scale factor for random actions
+        
+        # Get initial joint positions for each world
+        self.joint_pos_initial = torch.zeros(self.num_worlds, self.joint_dof_count, device=self.torch_device, dtype=torch.float32)
+        for world_idx in range(self.num_worlds):
+            start_idx = world_idx * articulation_builder.joint_dof_count + 6  # Skip floating base
+            end_idx = start_idx + self.joint_dof_count
+            self.joint_pos_initial[world_idx] = torch.tensor(
+                self.model.joint_q[start_idx:end_idx], 
+                device=self.torch_device, 
+                dtype=torch.float32
+            )
 
         # Evaluate forward kinematics for collision detection
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
@@ -128,6 +146,25 @@ class Example:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
+        # Generate random actions for each world
+        random_actions = (torch.rand(self.num_worlds, self.joint_dof_count, device=self.torch_device) - 0.5) * 2.0 * self.action_scale
+        
+        # Apply actions as joint position targets
+        for world_idx in range(self.num_worlds):
+            start_idx = world_idx * (self.joint_dof_count + 6)  # Include floating base in indexing
+            target_positions = self.joint_pos_initial[world_idx] + random_actions[world_idx]
+            
+            # Create full joint target array (floating base + actuated joints)
+            full_targets = torch.zeros(self.joint_dof_count + 6, device=self.torch_device, dtype=torch.float32)
+            full_targets[6:] = target_positions  # Set actuated joint targets
+            
+            # Convert to warp tensor and copy to control
+            targets_wp = wp.from_torch(full_targets, dtype=wp.float32, requires_grad=False)
+            wp.copy(
+                self.control.joint_target_pos[start_idx:start_idx + self.joint_dof_count + 6],
+                targets_wp
+            )
+
         if self.graph:
             wp.capture_launch(self.graph)
         else:
