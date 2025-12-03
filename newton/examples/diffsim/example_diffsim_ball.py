@@ -112,7 +112,8 @@ class Example:
 
         self.viewer.set_model(self.model)
 
-        # capture forward/backward passes
+        # capture forward/backward passes (i.e. capture the computation graph for GPU, so that
+        # we can replay simulation efficiently during optimization)
         self.capture()
 
     def capture(self):
@@ -146,23 +147,31 @@ class Example:
             self.solver.step(self.states[t], self.states[t + 1], self.control, self.contacts, self.sim_dt)
 
     def step(self):
+        # Execute forward simulation + backward gradient computation
+        # Uses captured CUDA graph for performance if available, otherwise runs directly
         if self.graph:
-            wp.capture_launch(self.graph)
+            wp.capture_launch(self.graph)  # GPU-optimized execution of forward_backward()
         else:
-            self.forward_backward()
+            self.forward_backward()        # CPU execution or first-time GPU execution
 
+        # Get reference to the optimization parameter (initial particle velocity)
+        # This is what we're optimizing to hit the target
         x = self.states[0].particle_qd
 
         if self.verbose:
             print(f"Train iter: {self.train_iter} Loss: {self.loss}")
             print(f"    x: {x} g: {x.grad}")
 
-        # gradient descent step
+        # Perform gradient descent optimization step
+        # Updates initial velocity: x_new = x_old - learning_rate * gradient
+        # This moves the parameter in the direction that reduces the loss
         wp.launch(step_kernel, dim=len(x), inputs=[x, x.grad, self.train_rate])
 
-        # clear grads for next iteration
+        # Reset all gradients to zero for the next iteration
+        # Essential to prevent gradient accumulation across iterations
         self.tape.zero()
 
+        # Increment iteration counter and record loss for convergence tracking
         self.train_iter += 1
         self.loss_history.append(self.loss.numpy()[0])
 
