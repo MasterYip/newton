@@ -177,6 +177,9 @@ def forward_backward(self):
 - **Memory Optimization**: Gradient computation scales with output dimension, not parameter count
 
 ### 3. Gradient-Based Optimization
+
+> **NOTE**: This optimize all envs trajectories, and select the best one after n times optimization
+
 ```python
 self.optimizer = warp.optim.SGD(
     [self.rollouts.trajectories.flatten()],
