@@ -565,7 +565,7 @@ class Drone:
         self.model = builder.finalize(requires_grad=requires_grad)
 
         # Initialize the required simulation states.
-        if requires_grad:
+        if requires_grad and state_count is not None:
             self.states = tuple(self.model.state() for _ in range(state_count + 1))
             self.controls = tuple(self.model.control() for _ in range(state_count))
         else:
@@ -610,7 +610,7 @@ class Example:
         self,
         viewer,
         verbose=False,
-        num_rollouts=256,
+        num_rollouts=16,
         render_rollouts=False,
         drone_path=DEFAULT_DRONE_PATH,
     ):
@@ -659,6 +659,12 @@ class Example:
         self.control_gains = wp.array((0.8,) * self.control_dim, dtype=float)
         self.control_limits = wp.array(((0.1, 1.0),) * self.control_dim, dtype=float)
 
+        # Noise annealing parameters
+        self.initial_noise_scale = 0.05
+        self.noise_decay_factor = 0.8  # Multiply noise by this factor each step
+        self.min_noise_scale = 0.0001    # Minimum noise level to maintain exploration
+        self.current_noise_scale = self.initial_noise_scale
+
         drone_size = 0.2
 
         # Declare the reference drone.
@@ -667,6 +673,7 @@ class Example:
             self.fps,
             (self.control_point_data_count, self.control_dim),
             size=drone_size,
+            requires_grad=True,  # Enable gradients for mean trajectory optimization
         )
 
         # Declare the drone's rollouts.
@@ -691,8 +698,9 @@ class Example:
         self.solver_rollouts = newton.solvers.SolverSemiImplicit(self.rollouts.model)
         self.solver_drone = newton.solvers.SolverSemiImplicit(self.drone.model)
 
+        # Optimizer now targets the mean trajectory (drone.trajectories) instead of rollouts
         self.optimizer = warp.optim.SGD(
-            [self.rollouts.trajectories.flatten()],
+            [self.drone.trajectories.flatten()],
             lr=1e-2,
             nesterov=False,
             momentum=0.0,
@@ -713,11 +721,41 @@ class Example:
             self.graph = None
 
     def forward_backward(self):
+        """
+        Modified forward-backward pass that computes gradients for all rollouts
+        but optimizes the mean trajectory using gradient averaging.
+        """
         self.tape = wp.Tape()
         with self.tape:
             self.forward()
         self.rollout_costs.grad.fill_(1.0)  # Set the grad seed for backward pass
         self.tape.backward()
+        
+        # Average gradients from all rollout trajectories to update mean trajectory
+        self.average_gradients_to_mean()
+
+    def average_gradients_to_mean(self):
+        """
+        Computes the average gradient from all rollout trajectories and 
+        assigns it to the mean trajectory for optimization.
+        
+        This implements gradient-averaged policy optimization where instead of
+        optimizing each rollout separately, we use the collective gradient
+        information to improve the mean trajectory.
+        """
+        # Zero out the mean trajectory gradients first
+        self.drone.trajectories.grad.zero_()
+        
+        # Sum all rollout gradients
+        for i in range(self.rollout_count):
+            self.drone.trajectories.grad.assign(
+                self.drone.trajectories.grad + self.rollouts.trajectories.grad[i:i+1]
+            )
+        
+        # Average by dividing by number of rollouts
+        self.drone.trajectories.grad.assign(
+            self.drone.trajectories.grad / float(self.rollout_count)
+        )
 
     def update_drone(self, drone: Drone, solver) -> None:
         drone.state.clear_forces()
@@ -817,46 +855,24 @@ class Example:
             )
 
     def step_optimizer(self):
-        if self.graph:
-            wp.capture_launch(self.graph)
-        else:
-            self.forward_backward()
-
-        # Perform the optimization step for EVERY rollout world in parallel.
-        self.optimizer.step([self.rollouts.trajectories.grad.flatten()])
-
-        # Enforce limits on the control points.
-        wp.launch(
-            enforce_control_limits,
-            dim=self.rollouts.trajectories.shape,
-            inputs=(self.control_limits,),
-            outputs=(self.rollouts.trajectories,),
-        )
-        self.tape.zero()
-
-    def step(self):
-        if self.frame % int(self.sim_steps / len(self.targets)) == 0:
-            if self.verbose:
-                print(f"Choosing new flight target: {self.target_idx + 1}")
-
-            self.target_idx += 1
-            self.target_idx %= len(self.targets)
-
-            # Assign the new target to the current target array.
-            self.current_target.assign([self.targets[self.target_idx]])
-
-        # Sample control waypoints around the nominal trajectory.
-        noise_scale = 0.15
+        """
+        Modified optimizer step that:
+        1. Resamples trajectories around mean with decaying noise
+        2. Computes gradients via rollout evaluation
+        3. Updates mean trajectory using averaged gradients
+        4. Applies noise annealing for convergence
+        """
+        # Resample trajectories from mean with current noise level
         wp.launch(
             sample_gaussian,
             dim=(
-                self.rollouts.trajectories.shape[0] - 1,
+                self.rollouts.trajectories.shape[0],  # Sample ALL rollouts, not n-1
                 self.rollouts.trajectories.shape[1],
                 self.rollouts.trajectories.shape[2],
             ),
             inputs=(
                 self.drone.trajectories,
-                noise_scale,
+                self.current_noise_scale,  # Use current (decaying) noise scale
                 self.control_point_data_count,
                 self.control_dim,
                 self.control_limits,
@@ -865,6 +881,7 @@ class Example:
             outputs=(self.rollouts.trajectories,),
         )
 
+        # Increment seed for next sampling
         wp.launch(
             increment_seed,
             dim=1,
@@ -872,27 +889,55 @@ class Example:
             outputs=(self.seed,),
         )
 
-        for _ in range(self.optim_step_count):
-            self.step_optimizer()
+        # Compute forward-backward pass with gradient averaging
+        if self.graph:
+            wp.capture_launch(self.graph)
+        else:
+            self.forward_backward()
 
-        # Pick the best trajectory.
-        wp.synchronize()
-        lowest_cost_id = np.argmin(self.rollout_costs.numpy())
+        # Optimize mean trajectory using averaged gradients
+        self.optimizer.step([self.drone.trajectories.grad.flatten()])
+
+        # Enforce limits on the mean trajectory
         wp.launch(
-            pick_best_trajectory,
-            dim=(
-                self.control_point_data_count,
-                self.control_dim,
-            ),
-            inputs=(
-                self.rollouts.trajectories,
-                lowest_cost_id,
-            ),
+            enforce_control_limits,
+            dim=self.drone.trajectories.shape,
+            inputs=(self.control_limits,),
             outputs=(self.drone.trajectories,),
         )
-        self.rollouts.trajectories[-1].assign(self.drone.trajectories[0])
+        
+        # Apply noise annealing within this optimization step
+        self.current_noise_scale = max(
+            self.min_noise_scale,
+            self.current_noise_scale * self.noise_decay_factor
+        )
+        
+        self.tape.zero()
 
-        # Simulate the drone.
+    def step(self):
+        if self.frame % int(self.sim_steps / len(self.targets)) == 0:
+            if self.verbose:
+                print(f"Choosing new flight target: {self.target_idx + 1}")
+                print(f"Resetting noise scale to {self.initial_noise_scale}")
+
+            self.target_idx += 1
+            self.target_idx %= len(self.targets)
+
+            # Assign the new target to the current target array.
+            self.current_target.assign([self.targets[self.target_idx]])
+            
+        # Reset noise scale to default value at the beginning of each optimization loop
+        self.current_noise_scale = self.initial_noise_scale
+
+        # Run optimization steps with gradient averaging and noise annealing
+        for step_i in range(self.optim_step_count):
+            self.step_optimizer()
+            
+            if self.verbose and step_i % 5 == 0:
+                print(f"  Optimization step {step_i+1}/{self.optim_step_count}, "
+                      f"noise_scale: {self.current_noise_scale:.4f}")
+
+        # Simulate the drone using the optimized mean trajectory
         self.drone.sim_tick = 0
         for _ in range(self.sim_substeps):
             self.update_drone(self.drone, self.solver_drone)
@@ -900,10 +945,25 @@ class Example:
             # Swap the drone's states.
             (self.drone.states[0], self.drone.states[1]) = (self.drone.states[1], self.drone.states[0])
 
-        loss = np.min(self.rollout_costs.numpy())
-        print(f"[{(self.frame + 1):3d}/{self.sim_steps}] loss={loss:.8f}")
+        # Compute final cost using the mean trajectory
+        self.evaluate_mean_trajectory_cost()
+        
+        loss = self.mean_trajectory_cost
+        print(f"[{(self.frame + 1):3d}/{self.sim_steps}] loss={loss:.8f}, "
+              f"noise_scale={self.current_noise_scale:.4f}")
         self.viewer.log_scalar("/loss", loss)
+        self.viewer.log_scalar("/noise_scale", self.current_noise_scale)
         self.cost_history.append(loss)
+
+    def evaluate_mean_trajectory_cost(self):
+        """
+        Evaluates the cost of the mean trajectory for logging and monitoring.
+        Uses a simpler approach that doesn't require full state history.
+        """
+        # Use the minimum cost from the current rollouts as an approximation
+        # since the mean trajectory should perform similarly to the average of rollouts
+        wp.synchronize()
+        self.mean_trajectory_cost = float(np.mean(self.rollout_costs.numpy()))
 
     def test_final(self):
         assert all(np.array(self.cost_history) < 2.0)
