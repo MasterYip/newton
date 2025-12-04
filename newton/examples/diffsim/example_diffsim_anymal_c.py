@@ -420,7 +420,7 @@ class Example:
         self.command = wp.vec3(1.0, 0.0, 0.0)  # Walk forward at 1 m/s
         
         # MPC parameters
-        self.optim_step_count = 10
+        self.optim_step_count = 6
         self.control_point_step = 5  # Steps between control waypoints
         self.control_point_count = 4  # Number of waypoints
         self.control_point_data_count = self.control_point_count + 1
@@ -431,7 +431,7 @@ class Example:
         self.action_scale = 0.5  # Scale for action -> joint position
         
         # Control limits (action space, not joint limits)
-        self.control_limits = wp.array([(-1.0, 1.0)] * self.control_dim, dtype=float)
+        self.control_limits = wp.array([(-10.0, 10.0)] * self.control_dim, dtype=float)
         
         # Create reference robot
         self.robot = ANYmalC(
@@ -462,7 +462,7 @@ class Example:
             self.rollouts.model,
             use_mujoco_contacts=args.use_mujoco_contacts if args else False,
             ls_parallel=True,
-            njmax=6144,
+            njmax=16384,
             nconmax=6144,
         )
         
@@ -470,7 +470,7 @@ class Example:
             self.robot.model,
             use_mujoco_contacts=args.use_mujoco_contacts if args else False,
             ls_parallel=True,
-            njmax=6144,
+            njmax=16384,
             nconmax=6144,
         )
         
@@ -648,7 +648,7 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--verbose", action="store_true", help="Print status messages.")
-    parser.add_argument("--num_rollouts", type=int, default=16, help="Number of rollouts for MPC.")
+    parser.add_argument("--num_rollouts", type=int, default=8, help="Number of rollouts for MPC.")
     
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args.verbose, args.num_rollouts, args)
