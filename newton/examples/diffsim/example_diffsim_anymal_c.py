@@ -438,6 +438,10 @@ class Example:
         self.rollout_costs = wp.zeros(self.rollout_count, dtype=float, requires_grad=True)
         self.cost_history = []
         
+        # Create collision pipeline from command-line args
+        self.collision_pipeline_robot = newton.examples.create_collision_pipeline(self.robot.model, args)
+        self.collision_pipeline_rollouts = newton.examples.create_collision_pipeline(self.rollouts.model, args)
+        
         # Solvers
         self.solver_rollouts = newton.solvers.SolverMuJoCo(
             self.rollouts.model,
@@ -462,6 +466,10 @@ class Example:
         
         # Evaluate FK to update body poses
         newton.eval_fk(self.robot.model, self.robot.state.joint_q, self.robot.state.joint_qd, self.robot.state)
+        
+        # Initialize contacts using collision pipeline
+        self.contacts_robot = self.robot.model.collide(self.robot.state, collision_pipeline=self.collision_pipeline_robot)
+        self.contacts_rollouts = self.rollouts.model.collide(self.rollouts.state, collision_pipeline=self.collision_pipeline_rollouts)
         
         self.viewer.set_model(self.robot.model)
         self.capture()
@@ -498,11 +506,30 @@ class Example:
         )
         
         # Set joint targets (skip first 6 for floating base)
-        for i in range(robot.variation_count):
-            for j in range(12):
-                robot.control.joint_target_pos[i * 18 + 6 + j] = robot.control.joint_targets[i * 12 + j]
+        # Create full target array with zeros for floating base DOFs
+        full_dof_count = 18  # 6 (floating base) + 12 (actuated joints)
+        total_size = robot.variation_count * full_dof_count
+        full_targets = wp.zeros(total_size, dtype=float, requires_grad=robot.requires_grad)
         
-        solver.step(robot.state, robot.next_state, robot.control, None, self.sim_dt)
+        # Copy actuated joint targets to the correct positions (skip first 6 DOFs per robot)
+        for i in range(robot.variation_count):
+            src_offset = i * 12
+            dst_offset = i * full_dof_count + 6
+            wp.copy(
+                full_targets,
+                robot.control.joint_targets,
+                dest_offset=dst_offset,
+                src_offset=src_offset,
+                count=12
+            )
+        
+        # Copy the full array to joint_target_pos
+        wp.copy(robot.control.joint_target_pos, full_targets)
+        
+        # Compute contacts using collision pipeline
+        contacts = robot.model.collide(robot.state, collision_pipeline=self.collision_pipeline_rollouts if robot.requires_grad else self.collision_pipeline_robot)
+        
+        solver.step(robot.state, robot.next_state, robot.control, contacts, self.sim_dt)
         robot.sim_tick += 1
     
     def forward(self):
@@ -618,7 +645,7 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--verbose", action="store_true", help="Print status messages.")
-    parser.add_argument("--num_rollouts", type=int, default=32, help="Number of rollouts for MPC.")
+    parser.add_argument("--num_rollouts", type=int, default=8, help="Number of rollouts for MPC.")
     
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args.verbose, args.num_rollouts, args)
