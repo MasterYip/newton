@@ -232,6 +232,21 @@ def anymal_cost(
 
 
 @wp.kernel
+def distribute_joint_targets(
+    actuated_targets: wp.array(dtype=float),
+    full_targets: wp.array(dtype=float),
+    num_robots: int,
+):
+    """Distribute actuated joint targets (12 per robot) to full DOF array (18 per robot, first 6 are floating base)."""
+    robot_id, joint_id = wp.tid()
+    # Source: 12 actuated joints per robot
+    src_idx = robot_id * 12 + joint_id
+    # Destination: skip first 6 DOFs (floating base) per robot
+    dst_idx = robot_id * 18 + 6 + joint_id
+    full_targets[dst_idx] = actuated_targets[src_idx]
+
+
+@wp.kernel
 def enforce_control_limits(
     control_limits: wp.array(dtype=float, ndim=2),
     control_points: wp.array(dtype=float, ndim=3),
@@ -447,14 +462,16 @@ class Example:
             self.rollouts.model,
             use_mujoco_contacts=args.use_mujoco_contacts if args else False,
             ls_parallel=True,
-            njmax=50,
+            njmax=6144,
+            nconmax=6144,
         )
         
         self.solver_robot = newton.solvers.SolverMuJoCo(
             self.robot.model,
             use_mujoco_contacts=args.use_mujoco_contacts if args else False,
             ls_parallel=True,
-            njmax=50,
+            njmax=6144,
+            nconmax=6144,
         )
         
         self.optimizer = warp.optim.SGD(
@@ -505,26 +522,12 @@ class Example:
             outputs=(robot.control.joint_targets,),
         )
         
-        # Set joint targets (skip first 6 for floating base)
-        # Create full target array with zeros for floating base DOFs
-        full_dof_count = 18  # 6 (floating base) + 12 (actuated joints)
-        total_size = robot.variation_count * full_dof_count
-        full_targets = wp.zeros(total_size, dtype=float, requires_grad=robot.requires_grad)
-        
-        # Copy actuated joint targets to the correct positions (skip first 6 DOFs per robot)
-        for i in range(robot.variation_count):
-            src_offset = i * 12
-            dst_offset = i * full_dof_count + 6
-            wp.copy(
-                full_targets,
-                robot.control.joint_targets,
-                dest_offset=dst_offset,
-                src_offset=src_offset,
-                count=12
-            )
-        
-        # Copy the full array to joint_target_pos
-        wp.copy(robot.control.joint_target_pos, full_targets)
+        # Distribute actuated joint targets (12 DOF) to full state including floating base (18 DOF)
+        wp.launch(
+            distribute_joint_targets,
+            dim=(robot.variation_count, 12),
+            inputs=(robot.control.joint_targets, robot.control.joint_target_pos, robot.variation_count),
+        )
         
         # Compute contacts using collision pipeline
         contacts = robot.model.collide(robot.state, collision_pipeline=self.collision_pipeline_rollouts if robot.requires_grad else self.collision_pipeline_robot)
@@ -645,7 +648,7 @@ class Example:
 if __name__ == "__main__":
     parser = newton.examples.create_parser()
     parser.add_argument("--verbose", action="store_true", help="Print status messages.")
-    parser.add_argument("--num_rollouts", type=int, default=8, help="Number of rollouts for MPC.")
+    parser.add_argument("--num_rollouts", type=int, default=16, help="Number of rollouts for MPC.")
     
     viewer, args = newton.examples.init(parser)
     example = Example(viewer, args.verbose, args.num_rollouts, args)
